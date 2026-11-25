@@ -9,6 +9,9 @@ mod run;
 mod shader;
 mod translate;
 
+#[cfg(all(windows, victory_agility_sdk))]
+victory_shader::export_agility_sdk!(env!("VICTORY_AGILITY_SDK_VERSION"));
+
 use std::path::PathBuf;
 
 use anyhow::Result;
