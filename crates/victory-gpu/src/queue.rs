@@ -585,13 +585,18 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// Prefix of `D3D12XBOX_PRESENT_PLANE_PARAMETERS`: frame token, resource
+/// count, and resource pointer array.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
 }
+
+/// Byte stride of `D3D12XBOX_PRESENT_PLANE_PARAMETERS` when multiple planes
+/// are passed (`PresentX` passes 9 qwords per plane on Series X|S titles).
+const PLANE_STRIDE: usize = 0x48;
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -816,24 +821,64 @@ extern "system" fn present(
     }
     #[cfg(windows)]
     if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
+        && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        const PIXEL_RESOURCE: u32 = 0x80;
+        let mut entries = Vec::with_capacity(planes as usize);
+        for i in 0..planes as usize {
+            // SAFETY: the title passes `planes` plane structs; single-plane
+            // callers only guarantee the `Plane` prefix, multi-plane ones use
+            // `PLANE_STRIDE`.
+            let plane = unsafe {
+                plane_parameters
+                    .cast::<u8>()
+                    .add(i * PLANE_STRIDE)
+                    .cast::<Plane>()
+                    .as_ref()
+            };
+            let Some(plane) = plane else { continue };
+            if plane.count == 0 || plane.resources.is_null() {
+                continue;
+            }
+            // SAFETY: the plane lists `count` resources.
+            let resource = unsafe { *plane.resources };
+            if entries.iter().any(|&(seen, _, _)| seen == resource) {
+                continue;
+            }
+            let Some(texture) = crate::resource::host_resource(resource) else {
+                continue;
+            };
+            let wanted = if entries.is_empty() {
+                COPY_SOURCE
+            } else {
+                PIXEL_RESOURCE
+            };
+            let state = crate::resource::host_transition(resource, wanted)
+                .map_or(wanted, |(_, before)| before);
+            entries.push((resource, state, texture));
+        }
+        if entries.len() > 1 {
+            static MULTI: std::sync::Once = std::sync::Once::new();
+            MULTI.call_once(|| {
+                tracing::info!(planes, frame, "multi-plane PresentX compositing active");
+            });
+        }
+        if let Some(&(first_res, first_state, _)) = entries.first() {
+            let host_planes: Vec<_> = entries
+                .iter()
+                .map(|&(_, state, tex)| (tex, state))
+                .collect();
+            let shown = host.present_planes(&host_planes, frame);
+            for &(resource, state, _) in &entries {
+                crate::resource::host_transition(resource, state);
+            }
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, first_res, first_state, shown);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = (first_res, first_state, shown);
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
@@ -1082,5 +1127,14 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[test]
+    fn present_plane_prefix_and_stride_match_abi() {
+        assert_eq!(std::mem::size_of::<Plane>(), 24);
+        assert_eq!(std::mem::offset_of!(Plane, token), 0);
+        assert_eq!(std::mem::offset_of!(Plane, count), 8);
+        assert_eq!(std::mem::offset_of!(Plane, resources), 16);
+        assert_eq!(PLANE_STRIDE, 0x48);
     }
 }

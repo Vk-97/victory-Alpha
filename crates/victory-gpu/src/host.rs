@@ -1163,6 +1163,240 @@ fn record_plane_pass(
     }
 }
 
+const COMPOSITE_VS: &str = r#"
+struct Out {
+    float4 pos : SV_Position;
+    float2 uv  : TEXCOORD0;
+};
+Out corner(uint i : SV_VertexID) {
+    Out o;
+    float2 t = float2(float(i & 1) * 2.0, float(i >> 1) * 2.0);
+    o.pos = float4(t.x * 2.0 - 1.0, 1.0 - t.y * 2.0, 0.0, 1.0);
+    o.uv = t;
+    return o;
+}
+"#;
+
+const COMPOSITE_PS: &str = r#"
+#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP, visibility = SHADER_VISIBILITY_PIXEL)"
+Texture2D<float4> plane_tex : register(t0);
+SamplerState plane_samp : register(s0);
+[RootSignature(RS)]
+float4 plane(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    return plane_tex.Sample(plane_samp, uv);
+}
+"#;
+
+/// Pass that scales and alpha-blends secondary `PresentX` planes over the
+/// swap chain back buffer (Xbox titles such as Series S modes present UI in
+/// a separate display plane scaled onto the output).
+struct CompositePass {
+    views: ID3D12DescriptorHeap,
+    cpu: usize,
+    gpu: u64,
+    step: u32,
+    next: AtomicU32,
+    made: Mutex<Vec<(bool, i32, Option<PlanePipeline>)>>,
+}
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for CompositePass {}
+// SAFETY: as above.
+unsafe impl Sync for CompositePass {}
+
+fn composite_pass() -> Option<&'static CompositePass> {
+    static PASS: OnceLock<Option<CompositePass>> = OnceLock::new();
+    PASS.get_or_init(|| {
+        let host = host()?;
+        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        // SAFETY: plain heap creation and queries.
+        unsafe {
+            let views: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: PLANE_VIEWS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .ok()?;
+            Some(CompositePass {
+                cpu: views.GetCPUDescriptorHandleForHeapStart().ptr,
+                gpu: views.GetGPUDescriptorHandleForHeapStart().ptr,
+                step: host.device.GetDescriptorHandleIncrementSize(kind),
+                views,
+                next: AtomicU32::new(0),
+                made: Mutex::default(),
+            })
+        }
+    })
+    .as_ref()
+}
+
+impl CompositePass {
+    fn pipeline(&self, blend: bool, format: DXGI_FORMAT) -> Option<PlanePipeline> {
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, _, pipeline)) = made.iter().find(|m| (m.0, m.1) == (blend, format.0)) {
+            return pipeline.clone();
+        }
+        let pipeline = Self::make(blend, format)
+            .inspect_err(|e| {
+                tracing::warn!(error = %e, blend, format = format.0, "no pipeline to composite a display plane");
+            })
+            .ok();
+        made.push((blend, format.0, pipeline.clone()));
+        pipeline
+    }
+
+    fn make(blend: bool, format: DXGI_FORMAT) -> windows::core::Result<PlanePipeline> {
+        use windows::core::s;
+        let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+        let vs = compile(COMPOSITE_VS, s!("corner"), s!("vs_5_1"))?;
+        let ps = compile(COMPOSITE_PS, s!("plane"), s!("ps_5_1"))?;
+        let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: bytes.as_ptr().cast(),
+            BytecodeLength: bytes.len(),
+        };
+        let rt_blend = D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: blend.into(),
+            // Xbox overlay planes default to premultiplied alpha over lower planes.
+            SrcBlend: D3D12_BLEND_ONE,
+            DestBlend: if blend {
+                D3D12_BLEND_INV_SRC_ALPHA
+            } else {
+                D3D12_BLEND_ZERO
+            },
+            BlendOp: D3D12_BLEND_OP_ADD,
+            SrcBlendAlpha: D3D12_BLEND_ONE,
+            DestBlendAlpha: if blend {
+                D3D12_BLEND_INV_SRC_ALPHA
+            } else {
+                D3D12_BLEND_ZERO
+            },
+            BlendOpAlpha: D3D12_BLEND_OP_ADD,
+            LogicOp: D3D12_LOGIC_OP_NOOP,
+            RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            ..Default::default()
+        };
+        // SAFETY: the root signature is embedded in the pixel shader and the
+        // description points at valid slice data.
+        unsafe {
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
+            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: code(&vs[..]),
+                PS: code(&ps[..]),
+                BlendState: D3D12_BLEND_DESC {
+                    RenderTarget: [rt_blend; 8],
+                    ..Default::default()
+                },
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                RTVFormats: [
+                    format,
+                    DXGI_FORMAT_UNKNOWN,
+                    DXGI_FORMAT_UNKNOWN,
+                    DXGI_FORMAT_UNKNOWN,
+                    DXGI_FORMAT_UNKNOWN,
+                    DXGI_FORMAT_UNKNOWN,
+                    DXGI_FORMAT_UNKNOWN,
+                    DXGI_FORMAT_UNKNOWN,
+                ],
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            let pipeline: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc)?;
+            Ok((root, pipeline))
+        }
+    }
+}
+
+fn srv_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
+    match format.0 {
+        27 => DXGI_FORMAT_R8G8B8A8_UNORM,
+        90 => DXGI_FORMAT_B8G8R8A8_UNORM,
+        23 => DXGI_FORMAT_R10G10B10A2_UNORM,
+        9 => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        _ => format,
+    }
+}
+
+/// Draws `source` scaled across `rtv` (`width` x `height`, `target_format`),
+/// optionally alpha-blending it on top.
+fn draw_composite_plane(
+    host: &Host,
+    list: &ID3D12GraphicsCommandList,
+    source: &ID3D12Resource,
+    rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
+    width: u32,
+    height: u32,
+    target_format: DXGI_FORMAT,
+    blend: bool,
+) {
+    let Some(pass) = composite_pass() else { return };
+    // SAFETY: live resource.
+    let sd = unsafe { source.GetDesc() };
+    if (sd.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0) != 0 {
+        return;
+    }
+    let Some((root, pipeline)) = pass.pipeline(blend, target_format) else {
+        return;
+    };
+    let slot = pass.next.fetch_add(1, Ordering::Relaxed) % PLANE_VIEWS;
+    let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: srv_format(sd.Format),
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_SRV {
+                MipLevels: 1,
+                ..Default::default()
+            },
+        },
+    };
+    let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: pass.cpu + (slot * pass.step) as usize,
+    };
+    let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+        ptr: pass.gpu + u64::from(slot * pass.step),
+    };
+    // SAFETY: an open command list, a slot of our descriptor heap, and live resources.
+    unsafe {
+        host.device.CreateShaderResourceView(source, Some(&view), cpu);
+        list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
+        list.SetGraphicsRootSignature(&root);
+        list.SetPipelineState(&pipeline);
+        list.SetGraphicsRootDescriptorTable(0, gpu);
+        list.OMSetRenderTargets(1, Some(&rtv), false, None);
+        list.RSSetViewports(&[D3D12_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: width as f32,
+            Height: height as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        }]);
+        list.RSSetScissorRects(&[RECT {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        }]);
+        list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(4));
+        list.DrawInstanced(3, 1, 0, 0);
+    }
+}
+
 /// Records into `list` the copy of a depth texture into its colour twin
 /// (`colour`) or of the twin into the depth texture, both already in their
 /// copy states: whole textures of one size in one format family, which the
@@ -6596,10 +6830,17 @@ impl Meter {
 }
 
 impl Host {
-    /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// Presents one or more Xbox display planes onto the window's swap chain,
+    /// scaling and alpha-blending secondary planes over plane 0. `None` if
+    /// nothing was shown; else, in diagnostics builds, whether the frame was
+    /// black.
+    pub(crate) fn present_planes(
+        &self,
+        planes: &[(&ID3D12Resource, u32)],
+        frame: u64,
+    ) -> Option<bool> {
+        let &(texture, state) = planes.first()?;
+        let overlays = &planes[1..];
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -6645,7 +6886,7 @@ impl Host {
             }
         }
         let state = D3D12_RESOURCE_STATES(state as i32);
-        // SAFETY: our swap chain, list and a live source texture.
+        // SAFETY: our swap chain, list and live plane textures.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
@@ -6675,31 +6916,111 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
+            let mut pre = Vec::with_capacity(2);
+            if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                pre.push(transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE));
+            }
+            pre.push(transition(
+                &back,
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            ));
+            list.ResourceBarrier(&pre);
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
-            #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
-            #[cfg(not(feature = "diagnostics"))]
-            let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
+            let (capture, probe);
+            if overlays.is_empty() {
+                #[cfg(feature = "diagnostics")]
+                {
+                    capture = crate::capture::wanted(frame)
+                        .then(|| crate::capture::read_back(&self.device, list, texture))
+                        .flatten();
+                    probe = if slot.is_some() {
+                        None
+                    } else {
+                        crate::capture::probe(&self.device, list, texture)
+                    };
+                }
+                let mut post = Vec::with_capacity(2);
+                if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                    post.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
+                }
+                post.push(transition(
                     &back,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+                ));
+                list.ResourceBarrier(&post);
+            } else {
+                let mut to_rt = Vec::with_capacity(2);
+                if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                    to_rt.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
+                }
+                to_rt.push(transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                ));
+                list.ResourceBarrier(&to_rt);
+                let rtv = self.rtv(Some(&back), None);
+                for &(overlay, raw_state) in overlays {
+                    let o_state = D3D12_RESOURCE_STATES(legal_state(overlay, raw_state) as i32);
+                    if o_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                        list.ResourceBarrier(&[transition(
+                            overlay,
+                            o_state,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        )]);
+                    }
+                    draw_composite_plane(
+                        self, list, overlay, rtv, p.width, p.height, p.format, true,
+                    );
+                    if o_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                        list.ResourceBarrier(&[transition(
+                            overlay,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                            o_state,
+                        )]);
+                    }
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    let want_capture = crate::capture::wanted(frame);
+                    let want_probe = slot.is_none();
+                    if want_capture || want_probe {
+                        list.ResourceBarrier(&[transition(
+                            &back,
+                            D3D12_RESOURCE_STATE_RENDER_TARGET,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        )]);
+                        capture = want_capture
+                            .then(|| crate::capture::read_back(&self.device, list, &back))
+                            .flatten();
+                        probe = want_probe
+                            .then(|| crate::capture::probe(&self.device, list, &back))
+                            .flatten();
+                        list.ResourceBarrier(&[transition(
+                            &back,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_PRESENT,
+                        )]);
+                    } else {
+                        capture = None;
+                        probe = None;
+                        list.ResourceBarrier(&[transition(
+                            &back,
+                            D3D12_RESOURCE_STATE_RENDER_TARGET,
+                            D3D12_RESOURCE_STATE_PRESENT,
+                        )]);
+                    }
+                }
+                #[cfg(not(feature = "diagnostics"))]
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                )]);
+            }
             copy.close();
             match slot {
                 Some(i) => {
